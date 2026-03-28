@@ -940,6 +940,9 @@ object NativeConverters extends Logging {
       case DayOfMonth(child) => buildExtScalarFunction("Spark_Day", child :: Nil, IntegerType)
       case DayOfWeek(child) =>
         buildExtScalarFunction("Spark_DayOfWeek", child :: Nil, IntegerType)
+      case WeekOfYear(child) =>
+        buildExtScalarFunction("Spark_WeekOfYear", child :: Nil, IntegerType)
+
       case Quarter(child) => buildExtScalarFunction("Spark_Quarter", child :: Nil, IntegerType)
 
       case e: Levenshtein =>
