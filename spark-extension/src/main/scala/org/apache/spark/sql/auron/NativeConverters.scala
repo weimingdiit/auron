@@ -941,7 +941,7 @@ object NativeConverters extends Logging {
       case DayOfWeek(child) =>
         buildExtScalarFunction("Spark_DayOfWeek", child :: Nil, IntegerType)
       case WeekOfYear(child) =>
-        buildExtScalarFunction("Spark_WeekOfYear", child :: Nil, IntegerType)
+        buildTimePartExt("Spark_WeekOfYear", child, isPruningExpr, fallback)
 
       case Quarter(child) => buildExtScalarFunction("Spark_Quarter", child :: Nil, IntegerType)
 

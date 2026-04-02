@@ -23,7 +23,7 @@ use arrow::{
 use chrono::{Duration, TimeZone, Utc, prelude::*};
 use chrono_tz::Tz;
 use datafusion::{
-    common::{Result, ScalarValue},
+    common::{DataFusionError, Result, ScalarValue},
     physical_plan::ColumnarValue,
 };
 use datafusion_ext_commons::arrow::cast::cast;
@@ -80,9 +80,11 @@ pub fn spark_dayofweek(args: &[ColumnarValue]) -> Result<ColumnarValue> {
 ///
 /// For `Timestamp` inputs, this function interprets epoch milliseconds in the
 /// provided timezone (if any) before deriving the calendar date and ISO week.
-/// If no timezone is provided, `UTC` is used by default. For `Date` and
-/// compatible string inputs, the behavior is unchanged: the value is cast to
-/// `Date32` and the ISO week is computed from the resulting date.
+/// If no timezone is provided, `UTC` is used by default. If an invalid
+/// timezone string is provided, the function returns an execution error.
+/// For `Date` and compatible string inputs, the behavior is unchanged: the
+/// value is cast to `Date32` and the ISO week is computed from the resulting
+/// date.
 pub fn spark_weekofyear(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     // First argument as an Arrow array (date/timestamp/string, etc.)
     let array = args[0].clone().into_array(1)?;
@@ -94,7 +96,9 @@ pub fn spark_weekofyear(args: &[ColumnarValue]) -> Result<ColumnarValue> {
         match &args[1] {
             ColumnarValue::Scalar(ScalarValue::Utf8(Some(s)))
             | ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(s))) => {
-                s.parse::<Tz>().unwrap_or(default_tz)
+                s.parse::<Tz>().map_err(|_| {
+                    DataFusionError::Execution(format!("spark_weekofyear invalid timezone: {s}"))
+                })?
             }
             _ => default_tz,
         }
@@ -399,6 +403,40 @@ mod tests {
         ]));
         assert_eq!(&spark_weekofyear(&args)?.into_array(1)?, &expected_ret);
         Ok(())
+    }
+
+    #[test]
+    fn test_spark_weekofyear_with_timezone() -> Result<()> {
+        // In America/New_York:
+        // 2021-01-04 04:30:00 UTC -> 2021-01-03 23:30:00 local -> ISO week 53
+        // 2021-01-04 05:30:00 UTC -> 2021-01-04 00:30:00 local -> ISO week 1
+        let input = Arc::new(TimestampMillisecondArray::from(vec![
+            Some(utc_ms(2021, 1, 4, 4, 30, 0)),
+            Some(utc_ms(2021, 1, 4, 5, 30, 0)),
+            None,
+        ]));
+        let args = vec![
+            ColumnarValue::Array(input),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("America/New_York".to_string()))),
+        ];
+        let expected_ret: ArrayRef = Arc::new(Int32Array::from(vec![Some(53), Some(1), None]));
+        assert_eq!(&spark_weekofyear(&args)?.into_array(3)?, &expected_ret);
+        Ok(())
+    }
+
+    #[test]
+    fn test_spark_weekofyear_invalid_timezone() {
+        let input = Arc::new(TimestampMillisecondArray::from(vec![Some(utc_ms(
+            2021, 1, 4, 5, 30, 0,
+        ))]));
+        let args = vec![
+            ColumnarValue::Array(input),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("Mars/Olympus".to_string()))),
+        ];
+
+        let err =
+            spark_weekofyear(&args).expect_err("spark_weekofyear should fail for invalid timezone");
+        assert!(err.to_string().contains("invalid timezone"));
     }
 
     #[test]
