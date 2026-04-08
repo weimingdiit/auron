@@ -23,6 +23,7 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 import org.apache.commons.lang3.reflect.MethodUtils
+import org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat
 import org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
 import org.apache.spark.Partition
 import org.apache.spark.broadcast.Broadcast
@@ -57,6 +58,7 @@ import org.apache.spark.sql.execution.aggregate.SortAggregateExec
 import org.apache.spark.sql.execution.auron.plan.ConvertToNativeBase
 import org.apache.spark.sql.execution.auron.plan.NativeAggBase
 import org.apache.spark.sql.execution.auron.plan.NativeBroadcastExchangeBase
+import org.apache.spark.sql.execution.auron.plan.NativeOrcInsertIntoHiveTableBase
 import org.apache.spark.sql.execution.auron.plan.NativeOrcScanBase
 import org.apache.spark.sql.execution.auron.plan.NativeParquetScanBase
 import org.apache.spark.sql.execution.auron.plan.NativeSortBase
@@ -70,7 +72,17 @@ import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.hive.execution.InsertIntoHiveTable
 import org.apache.spark.sql.hive.execution.auron.plan.NativeHiveTableScanBase
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.types.BinaryType
+import org.apache.spark.sql.types.BooleanType
+import org.apache.spark.sql.types.ByteType
+import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.DoubleType
+import org.apache.spark.sql.types.FloatType
+import org.apache.spark.sql.types.IntegerType
 import org.apache.spark.sql.types.LongType
+import org.apache.spark.sql.types.ShortType
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.types.StructType
 
 import org.apache.auron.configuration.AuronConfiguration
 import org.apache.auron.jni.AuronAdaptor
@@ -101,6 +113,9 @@ object AuronConverters extends Logging {
   def enableGenerate: Boolean = SparkAuronConfiguration.ENABLE_GENERATE.get()
   def enableLocalTableScan: Boolean = SparkAuronConfiguration.ENABLE_LOCAL_TABLE_SCAN.get()
   def enableDataWriting: Boolean = SparkAuronConfiguration.ENABLE_DATA_WRITING.get()
+  def enableDataWritingParquet: Boolean =
+    SparkAuronConfiguration.ENABLE_DATA_WRITING_PARQUET.get()
+  def enableDataWritingOrc: Boolean = SparkAuronConfiguration.ENABLE_DATA_WRITING_ORC.get()
   def enableScanParquet: Boolean = SparkAuronConfiguration.ENABLE_SCAN_PARQUET.get()
   def enableScanParquetTimestamp: Boolean =
     SparkAuronConfiguration.ENABLE_SCAN_PARQUET_TIMESTAMP.get()
@@ -131,6 +146,16 @@ object AuronConverters extends Logging {
       config.SHUFFLE_MANAGER.defaultValueString)
     supportedShuffleManagers.exists(name.contains)
   }
+
+  def isOrcWriteTypeSupported(dataType: DataType): Boolean = dataType match {
+    case BooleanType | ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType |
+        StringType | BinaryType =>
+      true
+    case _ => false
+  }
+
+  def isOrcWriteSchemaSupported(schema: StructType): Boolean =
+    schema.forall(field => isOrcWriteTypeSupported(field.dataType))
 
   def convertSparkPlanRecursively(exec: SparkPlan): SparkPlan = {
     // convert
@@ -1012,25 +1037,50 @@ object AuronConverters extends Logging {
 
   def convertDataWritingCommandExec(exec: DataWritingCommandExec): SparkPlan = {
     logDebugPlanConversion(exec)
+
+    def isParquetInsertIntoHiveTable(cmd: InsertIntoHiveTable): Boolean =
+      cmd.table.storage.outputFormat.contains(classOf[MapredParquetOutputFormat].getName)
+
+    def isOrcInsertIntoHiveTable(cmd: InsertIntoHiveTable): Boolean =
+      cmd.table.storage.outputFormat.contains(classOf[OrcOutputFormat].getName)
+
+    def failWhenDataWritingDisabled(enabled: Boolean, confKey: String): Unit = {
+      if (!enabled) {
+        throw new NotImplementedError(s"Conversion disabled: $confKey=false.")
+      }
+    }
+
+    def sortInsertChild(cmd: InsertIntoHiveTable, child: SparkPlan): SparkPlan = {
+      var sortedChild = convertToNative(child)
+      val numDynParts = cmd.partition.count(_._2.isEmpty)
+      val requiredOrdering =
+        child.output.slice(child.output.length - numDynParts, child.output.length)
+      if (requiredOrdering.nonEmpty && child.outputOrdering.map(_.child) != requiredOrdering) {
+        val rowNumExpr = StubExpr("RowNum", LongType, nullable = false)
+        sortedChild = Shims.get.createNativeSortExec(
+          requiredOrdering.map(SortOrder(_, Ascending)) ++ Seq(SortOrder(rowNumExpr, Ascending)),
+          global = false,
+          sortedChild)
+      }
+      sortedChild
+    }
+
     exec match {
       case DataWritingCommandExec(cmd: InsertIntoHiveTable, child)
-          if cmd.table.storage.outputFormat.contains(
-            classOf[MapredParquetOutputFormat].getName) =>
-        // add an extra SortExec to sort child with dynamic columns
-        // add row number to achieve stable sort
-        var sortedChild = convertToNative(child)
-        val numDynParts = cmd.partition.count(_._2.isEmpty)
-        val requiredOrdering =
-          child.output.slice(child.output.length - numDynParts, child.output.length)
-        if (requiredOrdering.nonEmpty && child.outputOrdering.map(_.child) != requiredOrdering) {
-          val rowNumExpr = StubExpr("RowNum", LongType, nullable = false)
-          sortedChild = Shims.get.createNativeSortExec(
-            requiredOrdering.map(SortOrder(_, Ascending)) ++ Seq(
-              SortOrder(rowNumExpr, Ascending)),
-            global = false,
-            sortedChild)
+          if isParquetInsertIntoHiveTable(cmd) =>
+        failWhenDataWritingDisabled(
+          enableDataWritingParquet,
+          "spark.auron.enable.data.writing.parquet")
+        Shims.get.createNativeParquetInsertIntoHiveTableExec(cmd, sortInsertChild(cmd, child))
+
+      case DataWritingCommandExec(cmd: InsertIntoHiveTable, child)
+          if isOrcInsertIntoHiveTable(cmd) =>
+        failWhenDataWritingDisabled(enableDataWritingOrc, "spark.auron.enable.data.writing.orc")
+        if (NativeOrcInsertIntoHiveTableBase.isSupportedWriteSchema(cmd.table, cmd.partition)) {
+          Shims.get.createNativeOrcInsertIntoHiveTableExec(cmd, sortInsertChild(cmd, child))
+        } else {
+          throw new NotImplementedError("unsupported DataWritingCommandExec")
         }
-        Shims.get.createNativeParquetInsertIntoHiveTableExec(cmd, sortedChild)
 
       case _ =>
         throw new NotImplementedError("unsupported DataWritingCommandExec")
