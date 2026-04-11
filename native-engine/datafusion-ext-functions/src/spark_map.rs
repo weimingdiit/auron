@@ -281,7 +281,9 @@ fn get_or_compile_regex(
 
     let regex = Regex::new(pattern).map_err(|err| {
         datafusion::error::DataFusionError::Execution(format!(
-            "str_to_map {arg_name} arg must be a valid regex: {err}"
+            "str_to_map {arg_name} arg must be a valid Rust regex: {err}. \
+             Native str_to_map does not currently support the full set of Spark/Java regex \
+             constructs (for example look-around or backreferences)."
         ))
     })?;
     cache.insert(pattern.to_owned(), regex.clone());
@@ -312,6 +314,11 @@ fn columnar_value_to_string_array(
 /// - keyValueDelim is applied as entry.split(keyValueDelim, 2)
 /// - missing value => null
 /// - duplicate keys follow spark.sql.mapKeyDedupPolicy
+///
+/// Note: the native implementation uses Rust's regex engine for pairDelim and
+/// keyValueDelim. This covers common regex delimiters but does not fully match
+/// Java regex semantics used by Spark StringToMap (for example look-around and
+/// backreferences are not supported).
 pub fn str_to_map(args: &[ColumnarValue]) -> Result<ColumnarValue> {
     if args.len() < 3 || args.len() > 4 {
         return df_execution_err!("str_to_map requires 3 or 4 arguments");
@@ -1410,5 +1417,22 @@ mod test {
 
         assert_eq!(&actual, &expected);
         Ok(())
+    }
+
+    #[test]
+    fn test_str_to_map_reports_java_regex_limitation() {
+        let text = Arc::new(StringArray::from(vec![Some("a:1,b:2")])) as ArrayRef;
+
+        let err = str_to_map(&[
+            ColumnarValue::Array(text),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("(?=,)".to_string()))),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(":".to_string()))),
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some("EXCEPTION".to_string()))),
+        ])
+        .expect_err("str_to_map should reject unsupported Java-style regex constructs");
+
+        let msg = err.to_string().to_lowercase();
+        assert!(msg.contains("valid rust regex"));
+        assert!(msg.contains("spark/java regex"));
     }
 }
