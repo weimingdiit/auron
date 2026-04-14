@@ -30,6 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.DenseRank
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.expressions.NamedExpression
 import org.apache.spark.sql.catalyst.expressions.NullsFirst
+import org.apache.spark.sql.catalyst.expressions.PercentRank
 import org.apache.spark.sql.catalyst.expressions.Rank
 import org.apache.spark.sql.catalyst.expressions.RowNumber
 import org.apache.spark.sql.catalyst.expressions.SortOrder
@@ -118,6 +119,12 @@ abstract class NativeWindowBase(
             windowExprBuilder.setFuncType(pb.WindowFunctionType.Window)
             windowExprBuilder.setWindowFunc(pb.WindowFunction.DENSE_RANK)
 
+          case e: PercentRank =>
+            assert(
+              spec.frameSpecification == e.frame,
+              s"window frame not supported: ${spec.frameSpecification}")
+            windowExprBuilder.setFuncType(pb.WindowFunctionType.Window)
+            windowExprBuilder.setWindowFunc(pb.WindowFunction.PERCENT_RANK)
           case e: Sum =>
             assert(
               spec.frameSpecification == RowNumber().frame, // only supports RowFrame(Unbounde, CurrentRow)

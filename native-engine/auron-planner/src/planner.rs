@@ -636,6 +636,9 @@ impl PhysicalPlanner {
                                 protobuf::WindowFunction::DenseRank => {
                                     WindowFunction::RankLike(WindowRankType::DenseRank)
                                 }
+                                protobuf::WindowFunction::PercentRank => {
+                                    WindowFunction::PercentRank
+                                }
                             },
                             protobuf::WindowFunctionType::Agg => match w.agg_func() {
                                 protobuf::AggFunction::Min => WindowFunction::Agg(AggFunction::Min),

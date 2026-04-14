@@ -17,6 +17,7 @@ use std::{any::Any, fmt::Formatter, sync::Arc};
 
 use arrow::{
     array::{Array, ArrayRef, Int32Array},
+    compute::concat_batches,
     datatypes::SchemaRef,
     record_batch::{RecordBatch, RecordBatchOptions},
 };
@@ -37,7 +38,7 @@ use once_cell::sync::OnceCell;
 
 use crate::{
     common::execution_context::ExecutionContext,
-    window::{WindowExpr, window_context::WindowContext},
+    window::{WindowExpr, WindowFunctionProcessor, window_context::WindowContext},
 };
 
 #[derive(Debug)]
@@ -217,45 +218,29 @@ fn execute_window(
                 .map(|expr: &WindowExpr| expr.create_processor(&window_ctx))
                 .collect::<Result<Vec<_>>>()?;
 
-            while let Some(mut batch) = input.next().await.transpose()? {
-                let _timer = exec_ctx.baseline_metrics().elapsed_compute().timer();
-                let mut window_cols: Vec<ArrayRef> = processors
-                    .iter_mut()
-                    .map(|processor| processor.process_batch(&window_ctx, &batch))
-                    .collect::<Result<_>>()?;
-
-                if let Some(group_limit) = window_ctx.group_limit {
-                    assert_eq!(window_cols.len(), 1);
-                    let limited = arrow::compute::kernels::cmp::lt_eq(
-                        &window_cols[0],
-                        &Int32Array::new_scalar(group_limit as i32),
-                    )?;
-                    window_cols[0] = arrow::compute::filter(&window_cols[0], &limited)?;
-                    batch = arrow::compute::filter_record_batch(&batch, &limited)?;
+            if window_ctx.requires_full_partition() {
+                let mut staging_batches = vec![];
+                while let Some(batch) = input.next().await.transpose()? {
+                    staging_batches.push(batch);
                 }
 
-                let outputs: Vec<ArrayRef> = batch
-                    .columns()
-                    .iter()
-                    .cloned()
-                    .chain(if window_ctx.output_window_cols {
-                        window_cols
-                    } else {
-                        vec![]
-                    })
-                    .zip(window_ctx.output_schema.fields())
-                    .map(|(array, field)| {
-                        if array.data_type() != field.data_type() {
-                            return cast(&array, field.data_type());
-                        }
-                        Ok(array.clone())
-                    })
-                    .collect::<Result<_>>()?;
-                let output_batch = RecordBatch::try_new_with_options(
-                    window_ctx.output_schema.clone(),
-                    outputs,
-                    &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
-                )?;
+                if !staging_batches.is_empty() {
+                    let _timer = exec_ctx.baseline_metrics().elapsed_compute().timer();
+                    let batch = concat_batches(&window_ctx.input_schema, &staging_batches)?;
+                    let output_batch =
+                        process_window_batch(batch, &window_ctx, processors.as_mut_slice())?;
+                    exec_ctx
+                        .baseline_metrics()
+                        .record_output(output_batch.num_rows());
+                    sender.send(output_batch).await;
+                }
+                return Ok(());
+            }
+
+            while let Some(batch) = input.next().await.transpose()? {
+                let _timer = exec_ctx.baseline_metrics().elapsed_compute().timer();
+                let output_batch =
+                    process_window_batch(batch, &window_ctx, processors.as_mut_slice())?;
                 exec_ctx
                     .baseline_metrics()
                     .record_output(output_batch.num_rows());
@@ -263,6 +248,50 @@ fn execute_window(
             }
             Ok(())
         }))
+}
+
+fn process_window_batch(
+    mut batch: RecordBatch,
+    window_ctx: &WindowContext,
+    processors: &mut [Box<dyn WindowFunctionProcessor>],
+) -> Result<RecordBatch> {
+    let mut window_cols: Vec<ArrayRef> = processors
+        .iter_mut()
+        .map(|processor| processor.process_batch(window_ctx, &batch))
+        .collect::<Result<_>>()?;
+
+    if let Some(group_limit) = window_ctx.group_limit {
+        assert_eq!(window_cols.len(), 1);
+        let limited = arrow::compute::kernels::cmp::lt_eq(
+            &window_cols[0],
+            &Int32Array::new_scalar(group_limit as i32),
+        )?;
+        window_cols[0] = arrow::compute::filter(&window_cols[0], &limited)?;
+        batch = arrow::compute::filter_record_batch(&batch, &limited)?;
+    }
+
+    let outputs: Vec<ArrayRef> = batch
+        .columns()
+        .iter()
+        .cloned()
+        .chain(if window_ctx.output_window_cols {
+            window_cols
+        } else {
+            vec![]
+        })
+        .zip(window_ctx.output_schema.fields())
+        .map(|(array, field)| {
+            if array.data_type() != field.data_type() {
+                return cast(&array, field.data_type());
+            }
+            Ok(array.clone())
+        })
+        .collect::<Result<_>>()?;
+    Ok(RecordBatch::try_new_with_options(
+        window_ctx.output_schema.clone(),
+        outputs,
+        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )?)
 }
 
 #[cfg(test)]
@@ -442,6 +471,49 @@ mod test {
             "| 1  | 3  | 0  | 6             | 6       | 3             | 10     |",
             "| 2  | 4  | 0  | 7             | 7       | 4             | 14     |",
             "+----+----+----+---------------+---------+---------------+--------+",
+        ];
+        assert_batches_eq!(expected, &batches);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_percent_rank_window() -> Result<(), Box<dyn std::error::Error>> {
+        let session_ctx = SessionContext::new();
+        let task_ctx = session_ctx.task_ctx();
+
+        let input = build_table(
+            ("grp", &vec![1, 1, 1, 2]),
+            ("id", &vec![1, 1, 2, 5]),
+            ("v", &vec![10, 20, 30, 40]),
+        )?;
+        let window_exprs = vec![WindowExpr::new(
+            WindowFunction::PercentRank,
+            vec![],
+            Arc::new(Field::new("percent_rank", DataType::Float64, false)),
+            DataType::Float64,
+        )];
+        let window = Arc::new(WindowExec::try_new(
+            input,
+            window_exprs,
+            vec![Arc::new(Column::new("grp", 0))],
+            vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("id", 1)),
+                options: Default::default(),
+            }],
+            None,
+            true,
+        )?);
+        let stream = window.execute(0, task_ctx)?;
+        let batches = datafusion::physical_plan::common::collect(stream).await?;
+        let expected = vec![
+            "+-----+----+----+--------------+",
+            "| grp | id | v  | percent_rank |",
+            "+-----+----+----+--------------+",
+            "| 1   | 1  | 10 | 0.0          |",
+            "| 1   | 1  | 20 | 0.0          |",
+            "| 1   | 2  | 30 | 1.0          |",
+            "| 2   | 5  | 40 | 0.0          |",
+            "+-----+----+----+--------------+",
         ];
         assert_batches_eq!(expected, &batches);
         Ok(())
