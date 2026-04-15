@@ -16,13 +16,12 @@
  */
 package org.apache.spark.sql.execution.auron.plan
 
-import java.util
 import java.util.Locale
 import java.util.Properties
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingDeque
 
 import scala.collection.immutable.SortedMap
-import scala.collection.mutable
 
 import org.apache.hadoop.fs.FileSystem
 import org.apache.hadoop.fs.Path
@@ -179,18 +178,27 @@ class AuronOrcOutputFormat
 class OrcSinkTaskContext {
   var isNative: Boolean = false
   val processingOutputFiles = new LinkedBlockingDeque[String]()
-  val processedOutputFiles = new util.ArrayDeque[OutputFileStat]()
+  val processedOutputFiles = new LinkedBlockingDeque[OutputFileStat]()
 }
 
 object OrcSinkTaskContext {
-  private val instances = mutable.Map[Long, OrcSinkTaskContext]()
+  private val instances = new ConcurrentHashMap[Long, OrcSinkTaskContext]()
 
   def get: OrcSinkTaskContext = {
-    val taskId = TaskContext.get.taskAttemptId()
-    instances.getOrElseUpdate(
-      taskId, {
-        TaskContext.get().addTaskCompletionListener(_ => instances.remove(taskId))
-        new OrcSinkTaskContext
-      })
+    val taskContext = TaskContext.get()
+    val taskId = taskContext.taskAttemptId()
+    val existing = instances.get(taskId)
+    if (existing != null) {
+      existing
+    } else {
+      val created = new OrcSinkTaskContext
+      val previous = instances.putIfAbsent(taskId, created)
+      if (previous == null) {
+        taskContext.addTaskCompletionListener[Unit](_ => instances.remove(taskId, created))
+        created
+      } else {
+        previous
+      }
+    }
   }
 }
